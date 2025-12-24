@@ -1,0 +1,220 @@
+{
+  "summary": {
+    "total_traces": 100,
+    "unique_operations": 9,
+    "total_errors": 0,
+    "time_window": "1h"
+  },
+  "operations": [
+    {
+      "name": "POST /generate",
+      "count": 25,
+      "min_ms": 3723.842,
+      "max_ms": 16051.394,
+      "avg_ms": 8318.79056,
+      "p50_ms": 7474.318,
+      "p95_ms": 13493.289,
+      "p99_ms": 16051.394
+    },
+    {
+      "name": "generate",
+      "count": 25,
+      "min_ms": 1791.982,
+      "max_ms": 8249.08,
+      "avg_ms": 3307.32976,
+      "p50_ms": 3648.12,
+      "p95_ms": 7717.492,
+      "p99_ms": 8249.08
+    },
+    {
+      "name": "model_generate",
+      "count": 25,
+      "min_ms": 1790.435,
+      "max_ms": 8247.543,
+      "avg_ms": 3305.8339200000005,
+      "p50_ms": 3646.12,
+      "p95_ms": 7715.394,
+      "p99_ms": 8247.543
+    },
+    {
+      "name": "POST /generate http receive",
+      "count": 25,
+      "min_ms": 2.146,
+      "max_ms": 9588.752,
+      "avg_ms": 2556.6553600000007,
+      "p50_ms": 1858.142,
+      "p95_ms": 8255.336,
+      "p99_ms": 9588.752
+    },
+    {
+      "name": "GET /metrics",
+      "count": 75,
+      "min_ms": 1.198,
+      "max_ms": 13490.009,
+      "avg_ms": 1634.23548,
+      "p50_ms": 2.211,
+      "p95_ms": 10048.752,
+      "p99_ms": 13490.009
+    },
+    {
+      "name": "POST /generate http send",
+      "count": 50,
+      "min_ms": 0.0,
+      "max_ms": 7643.965,
+      "avg_ms": 1226.8254200000001,
+      "p50_ms": 5.848,
+      "p95_ms": 5841.163,
+      "p99_ms": 7643.965
+    },
+    {
+      "name": "GET /metrics http send",
+      "count": 150,
+      "min_ms": 0.0,
+      "max_ms": 13482.558,
+      "avg_ms": 816.7244533333336,
+      "p50_ms": 1.046,
+      "p95_ms": 7465.419,
+      "p99_ms": 13481.459
+    },
+    {
+      "name": "tokenize_input",
+      "count": 25,
+      "min_ms": 0.0,
+      "max_ms": 1.005,
+      "avg_ms": 0.31908,
+      "p50_ms": 0.0,
+      "p95_ms": 1.002,
+      "p99_ms": 1.005
+    },
+    {
+      "name": "decode_output",
+      "count": 25,
+      "min_ms": 0.0,
+      "max_ms": 1.26,
+      "avg_ms": 0.19188,
+      "p50_ms": 0.0,
+      "p95_ms": 1.015,
+      "p99_ms": 1.26
+    }
+  ],
+  "slowest_operations": [
+    {
+      "operation": "POST /generate",
+      "max_duration_ms": 16051.394,
+      "occurrences": 4
+    },
+    {
+      "operation": "GET /metrics",
+      "max_duration_ms": 13490.009,
+      "occurrences": 2
+    },
+    {
+      "operation": "GET /metrics http send",
+      "max_duration_ms": 13482.558,
+      "occurrences": 2
+    },
+    {
+      "operation": "POST /generate http receive",
+      "max_duration_ms": 9588.752,
+      "occurrences": 3
+    },
+    {
+      "operation": "generate",
+      "max_duration_ms": 8249.08,
+      "occurrences": 2
+    },
+    {
+      "operation": "model_generate",
+      "max_duration_ms": 8247.543,
+      "occurrences": 2
+    },
+    {
+      "operation": "POST /generate http send",
+      "max_duration_ms": 7643.965,
+      "occurrences": 1
+    },
+    {
+      "operation": "decode_output",
+      "max_duration_ms": 1.26,
+      "occurrences": 2
+    },
+    {
+      "operation": "tokenize_input",
+      "max_duration_ms": 1.005,
+      "occurrences": 4
+    }
+  ],
+  "bottlenecks": [
+    {
+      "span": "p1::GET /metrics http send",
+      "avg_duration_ms": 816.7244533333336,
+      "max_duration_ms": 13482.558,
+      "ratio": 16.508086595146064,
+      "occurrences": 150
+    },
+    {
+      "span": "p1::GET /metrics",
+      "avg_duration_ms": 1634.23548,
+      "max_duration_ms": 13490.009,
+      "ratio": 8.254629865213793,
+      "occurrences": 75
+    },
+    {
+      "span": "p2::POST /generate http send",
+      "avg_duration_ms": 962.6152999999998,
+      "max_duration_ms": 6001.026,
+      "ratio": 6.234085412937028,
+      "occurrences": 20
+    },
+    {
+      "span": "p1::POST /generate http send",
+      "avg_duration_ms": 1402.9655000000005,
+      "max_duration_ms": 7643.965,
+      "ratio": 5.448434049162291,
+      "occurrences": 30
+    },
+    {
+      "span": "p1::POST /generate http receive",
+      "avg_duration_ms": 2039.8223333333335,
+      "max_duration_ms": 9588.752,
+      "ratio": 4.7007780252757305,
+      "occurrences": 15
+    },
+    {
+      "span": "p1::model_generate",
+      "avg_duration_ms": 3113.1284000000005,
+      "max_duration_ms": 8247.543,
+      "ratio": 2.6492781344964755,
+      "occurrences": 10
+    },
+    {
+      "span": "p1::generate",
+      "avg_duration_ms": 3114.6043,
+      "max_duration_ms": 8249.08,
+      "ratio": 2.6485162176139037,
+      "occurrences": 10
+    },
+    {
+      "span": "p2::POST /generate http receive",
+      "avg_duration_ms": 3331.9049000000005,
+      "max_duration_ms": 8255.336,
+      "ratio": 2.4776625527337224,
+      "occurrences": 10
+    },
+    {
+      "span": "p2::model_generate",
+      "avg_duration_ms": 3434.3042666666665,
+      "max_duration_ms": 7715.394,
+      "ratio": 2.246566815551424,
+      "occurrences": 15
+    },
+    {
+      "span": "p2::generate",
+      "avg_duration_ms": 3435.8134,
+      "max_duration_ms": 7717.492,
+      "ratio": 2.2461906691440228,
+      "occurrences": 15
+    }
+  ],
+  "errors": []
+}

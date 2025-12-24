@@ -1,0 +1,46 @@
+# Jaeger Sampling Configuration
+# Reference: https://www.jaegertracing.io/docs/latest/sampling/
+
+sampling:
+  # Default sampling strategy for all services
+  default_strategy:
+    type: probabilistic
+    param: 1.0  # Sample 100% of traces in development
+
+  # Per-service sampling strategies
+  service_strategies:
+    - service: llm-inference-api
+      type: probabilistic
+      param: 1.0  # Sample all LLM API traces
+      operation_strategies:
+        - operation: "POST /generate"
+          type: probabilistic
+          param: 1.0
+        - operation: "GET /health"
+          type: probabilistic
+          param: 0.1  # Sample only 10% of health checks
+
+# Storage Configuration (Badger)
+storage:
+  type: badger
+  badger:
+    ephemeral: false
+    consistency: false
+    maintenance_interval: 5m
+    metrics_update_interval: 10s
+    
+# Query Service Configuration
+query:
+  max_clock_skew_adjustment: 0s
+  ui:
+    dependencies:
+      menu_enabled: true
+    monitor:
+      menu_enabled: true
+
+# Collector Configuration
+collector:
+  queue_size: 2000
+  num_workers: 50
+  zipkin:
+    host_port: ":9411"

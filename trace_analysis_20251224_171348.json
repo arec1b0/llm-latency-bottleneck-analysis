@@ -1,0 +1,44 @@
+{
+  "summary": {
+    "total_traces": 2,
+    "unique_operations": 2,
+    "total_errors": 0,
+    "time_window": "1h"
+  },
+  "operations": [
+    {
+      "name": "GET /metrics",
+      "count": 2,
+      "min_ms": 1.574,
+      "max_ms": 3.793,
+      "avg_ms": 2.6835,
+      "p50_ms": 3.793,
+      "p95_ms": 3.793,
+      "p99_ms": 3.793
+    },
+    {
+      "name": "GET /metrics http send",
+      "count": 4,
+      "min_ms": 0.0,
+      "max_ms": 2.164,
+      "avg_ms": 0.804,
+      "p50_ms": 1.052,
+      "p95_ms": 2.164,
+      "p99_ms": 2.164
+    }
+  ],
+  "slowest_operations": [
+    {
+      "operation": "GET /metrics",
+      "max_duration_ms": 3.793,
+      "occurrences": 1
+    },
+    {
+      "operation": "GET /metrics http send",
+      "max_duration_ms": 2.164,
+      "occurrences": 1
+    }
+  ],
+  "bottlenecks": [],
+  "errors": []
+}
