@@ -7,6 +7,7 @@ Loads model, manages generation, and tracks detailed timing metrics.
 
 import logging
 import os
+import time
 from typing import Optional, Dict, Any, Iterator
 from pathlib import Path
 
@@ -299,6 +300,196 @@ class InferenceEngine:
                 
             except Exception as e:
                 logger.error(f"Generation failed: {e}")
+                span.set_attribute("error", True)
+                span.record_exception(e)
+                self.metrics.record_error("generation_failed")
+                raise
+                
+            finally:
+                self.metrics.decrement_active_requests()
+    
+    def generate_stream(
+        self,
+        prompt: str,
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        do_sample: bool = True,
+        **kwargs,
+    ) -> Iterator[Dict[str, Any]]:
+        """
+        Generate text with streaming output and accurate TTFT/TPOT measurement.
+        
+        Args:
+            prompt: Input prompt text
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature
+            top_p: Nucleus sampling probability
+            do_sample: Enable sampling (vs greedy)
+            **kwargs: Additional generation parameters
+        
+        Yields:
+            Dictionary with token text and timing metrics
+        
+        Raises:
+            RuntimeError: If model is not loaded or generation fails
+        """
+        if not self._model_loaded:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+        
+        with self.tracer.start_as_current_span("generate_stream") as span:
+            span.set_attribute("prompt.length", len(prompt))
+            span.set_attribute("generation.max_new_tokens", max_new_tokens)
+            span.set_attribute("generation.temperature", temperature)
+            
+            try:
+                self.metrics.increment_active_requests()
+                
+                # Tokenize input
+                with self.tracer.start_as_current_span("tokenize_input") as tokenize_span:
+                    inputs = self.tokenizer(
+                        prompt,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=self.max_length,
+                    )
+                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                    prompt_tokens = inputs["input_ids"].shape[1]
+                    
+                    tokenize_span.set_attribute("prompt.tokens", prompt_tokens)
+                    span.set_attribute("prompt.tokens", prompt_tokens)
+                
+                # Configure generation
+                generation_config = GenerationConfig(
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=do_sample,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    **kwargs,
+                )
+                
+                # Start timing
+                timer = InferenceTimer(self.tracer)
+                timer.start("model_generate_stream")
+                
+                # Generate with streaming
+                with torch.no_grad():
+                    generated_ids = inputs["input_ids"].clone()
+                    first_token_recorded = False
+                    
+                    for i in range(max_new_tokens):
+                        # Get next token
+                        outputs = self.model(
+                            input_ids=generated_ids,
+                            attention_mask=inputs["attention_mask"] if "attention_mask" in inputs else None,
+                            use_cache=True,
+                        )
+                        
+                        # Get logits and sample next token
+                        logits = outputs.logits[:, -1, :]
+                        if do_sample:
+                            # Apply temperature
+                            logits = logits / temperature
+                            # Apply top-p filtering
+                            if top_p < 1.0:
+                                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                                sorted_indices_to_remove = cumulative_probs > top_p
+                                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                                sorted_indices_to_remove[..., -1] = 0
+                                indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                                logits[indices_to_remove] = float('-inf')
+                            
+                            # Sample
+                            probs = torch.softmax(logits, dim=-1)
+                            next_token = torch.multinomial(probs, num_samples=1)
+                        else:
+                            # Greedy
+                            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+                        
+                        # Record first token time
+                        if not first_token_recorded:
+                            timer.record_first_token()
+                            first_token_recorded = True
+                        
+                        # Append to sequence
+                        generated_ids = torch.cat([generated_ids, next_token], dim=1)
+                        
+                        # Decode the new token
+                        new_token_text = self.tokenizer.decode(
+                            next_token[0], 
+                            skip_special_tokens=True
+                        )
+                        
+                        # Check for end of sequence
+                        if next_token.item() == self.tokenizer.eos_token_id:
+                            break
+                        
+                        # Yield token with timing
+                        current_time = time.perf_counter()
+                        yield {
+                            "token": new_token_text,
+                            "token_id": next_token.item(),
+                            "sequence_position": i + 1,
+                            "current_time": current_time,
+                        }
+                
+                # Final timing
+                timings = timer.stop()
+                
+                # Decode full sequence for final response
+                full_generated_ids = generated_ids[0][prompt_tokens:]
+                full_text = self.tokenizer.decode(
+                    full_generated_ids,
+                    skip_special_tokens=True,
+                )
+                completion_tokens = len(full_generated_ids)
+                
+                # Yield final completion info
+                yield {
+                    "type": "completion",
+                    "generated_text": full_text,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                    "ttft": timings.first_token_time,
+                    "tpot": timings.average_tpot,
+                    "total_time": timings.total_time,
+                    "throughput_tokens_per_sec": (prompt_tokens + completion_tokens) / timings.total_time,
+                }
+                
+                # Record final metrics
+                inference_metrics = InferenceMetrics(
+                    ttft=timings.first_token_time,
+                    tpot=timings.average_tpot,
+                    total_tokens=prompt_tokens + completion_tokens,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_time=timings.total_time,
+                    memory_used_mb=timer.memory_end_mb or 0.0,
+                    gpu_memory_used_mb=timer.gpu_memory_end_mb,
+                )
+                
+                self.metrics.record_inference_metrics(inference_metrics)
+                
+                logger.info(
+                    f"Streaming generation completed - Prompt: {prompt_tokens} tokens, "
+                    f"Generated: {completion_tokens} tokens, "
+                    f"TTFT: {timings.first_token_time:.3f}s, "
+                    f"TPOT: {timings.average_tpot:.3f}s"
+                )
+                
+            except torch.cuda.OutOfMemoryError as e:
+                logger.error("Out of memory error during streaming generation")
+                span.set_attribute("error", True)
+                span.record_exception(e)
+                self.metrics.record_error("oom")
+                raise
+                
+            except Exception as e:
+                logger.error(f"Streaming generation failed: {e}")
                 span.set_attribute("error", True)
                 span.record_exception(e)
                 self.metrics.record_error("generation_failed")

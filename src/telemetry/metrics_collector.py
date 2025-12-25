@@ -128,6 +128,12 @@ class MetricsCollector:
             "Whether model is loaded (1) or not (0)"
         )
         
+        # Queue depth gauge
+        self.queue_depth = Gauge(
+            "llm_queue_depth",
+            "Number of requests waiting in queue"
+        )
+        
         self._initialized = True
         logger.info("MetricsCollector initialized")
     
@@ -200,6 +206,15 @@ class MetricsCollector:
             loaded: True if model is loaded, False otherwise
         """
         self.model_loaded.set(1 if loaded else 0)
+    
+    def update_queue_depth(self, depth: int) -> None:
+        """
+        Update queue depth metric.
+        
+        Args:
+            depth: Number of requests waiting in queue
+        """
+        self.queue_depth.set(depth)
     
     def update_system_metrics(self) -> None:
         """Update system-level metrics (CPU, memory)."""

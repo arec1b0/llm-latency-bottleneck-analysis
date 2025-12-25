@@ -6,12 +6,14 @@ Main API server with comprehensive OpenTelemetry instrumentation.
 
 import logging
 import os
+import asyncio
+import json
 from contextlib import asynccontextmanager
 from typing import Optional
 
 import torch
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
@@ -39,6 +41,14 @@ logger = logging.getLogger(__name__)
 # Global inference engine instance
 inference_engine: Optional[InferenceEngine] = None
 
+# Concurrency control
+inference_semaphore: Optional[asyncio.Semaphore] = None
+MAX_CONCURRENT_GENERATIONS = int(os.getenv("MAX_CONCURRENT_GENERATIONS", "1"))
+
+# Request tracking
+active_requests_count = 0
+queue_wait_times = []
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -50,9 +60,13 @@ async def lifespan(app: FastAPI):
     - Model loading
     - Graceful shutdown
     """
-    global inference_engine
+    global inference_engine, inference_semaphore
     
     logger.info("Starting LLM Inference API")
+    
+    # Initialize concurrency control
+    inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
+    logger.info(f"Concurrency limit set to {MAX_CONCURRENT_GENERATIONS} concurrent generations")
     
     # Initialize OpenTelemetry
     try:
@@ -183,7 +197,7 @@ async def health_check():
     
     Returns service status, model loading state, and system information.
     """
-    global inference_engine
+    global inference_engine, inference_semaphore, active_requests_count
     
     if not inference_engine:
         return HealthResponse(
@@ -202,12 +216,22 @@ async def health_check():
     # Update system metrics
     metrics.update_system_metrics()
     
+    # Calculate queue depth (requests waiting for semaphore)
+    queue_depth = 0
+    if inference_semaphore:
+        queue_depth = MAX_CONCURRENT_GENERATIONS - inference_semaphore._value
+        # Subtract active requests to get actual queue depth
+        queue_depth = max(0, queue_depth - active_requests_count)
+    
+    # Update queue depth metric
+    metrics.update_queue_depth(queue_depth)
+    
     return HealthResponse(
         status=status,
         model_loaded=inference_engine.is_loaded(),
         model_info=model_info,
         gpu_available=torch.cuda.is_available(),
-        active_requests=0,  # Could track this with middleware
+        active_requests=active_requests_count,
     )
 
 
@@ -224,7 +248,7 @@ async def generate_text(request: GenerateRequest):
     
     Returns generated text with detailed performance metrics.
     """
-    global inference_engine
+    global inference_engine, inference_semaphore
     
     if not inference_engine:
         logger.error("Inference engine not initialized")
@@ -234,21 +258,52 @@ async def generate_text(request: GenerateRequest):
             detail="Inference engine not initialized",
         )
     
-    # Lazy load model if not loaded
-    if not inference_engine.is_loaded():
-        try:
-            logger.info("Loading model on first request")
-            inference_engine.load_model()
-        except Exception as e:
-            logger.error(f"Failed to load model: {e}")
-            metrics.record_error("model_load_failed")
+    # Check concurrency limit
+    if inference_semaphore is None:
+        logger.error("Concurrency semaphore not initialized")
+        metrics.record_error("semaphore_not_initialized")
+        raise HTTPException(
+            status_code=503,
+            detail="Service not ready",
+        )
+    
+    # Try to acquire semaphore with timeout
+    try:
+        acquired = await asyncio.wait_for(
+            inference_semaphore.acquire(), 
+            timeout=5.0  # 5 second timeout for queue
+        )
+        if not acquired:
+            metrics.record_error("overloaded")
             raise HTTPException(
                 status_code=503,
-                detail=f"Failed to load model: {str(e)}",
+                detail="Service temporarily unavailable - too many concurrent requests",
             )
+    except asyncio.TimeoutError:
+        metrics.record_error("overloaded")
+        raise HTTPException(
+            status_code=429,
+            detail="Service overloaded - please try again later",
+        )
     
-    # Generate text
     try:
+        # Increment active requests counter
+        active_requests_count += 1
+        
+        # Lazy load model if not loaded
+        if not inference_engine.is_loaded():
+            try:
+                logger.info("Loading model on first request")
+                inference_engine.load_model()
+            except Exception as e:
+                logger.error(f"Failed to load model: {e}")
+                metrics.record_error("model_load_failed")
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Failed to load model: {str(e)}",
+                )
+        
+        # Generate text
         result = inference_engine.generate(
             prompt=request.prompt,
             max_new_tokens=request.max_tokens,
@@ -278,6 +333,144 @@ async def generate_text(request: GenerateRequest):
             status_code=500,
             detail=f"Generation failed: {str(e)}",
         )
+    finally:
+        # Always release the semaphore
+        if inference_semaphore:
+            inference_semaphore.release()
+        # Always decrement active requests counter
+        active_requests_count -= 1
+
+
+@app.post("/generate_stream", tags=["Generation"])
+async def generate_text_stream(request: GenerateRequest):
+    """
+    Generate text with streaming output for real-time TTFT/TPOT measurement.
+    
+    Returns Server-Sent Events (SSE) stream with tokens as they are generated.
+    Provides accurate Time to First Token (TTFT) and Time Per Output Token (TPOT).
+    
+    Example usage:
+    curl -X POST http://localhost:8000/generate_stream \
+         -H "Content-Type: application/json" \
+         -d '{"prompt": "Explain AI", "max_tokens": 50}' \
+         --no-buffer
+    """
+    global inference_engine, inference_semaphore
+    
+    if not inference_engine:
+        logger.error("Inference engine not initialized")
+        metrics.record_error("engine_not_initialized")
+        raise HTTPException(
+            status_code=503,
+            detail="Inference engine not initialized",
+        )
+    
+    # Check concurrency limit
+    if inference_semaphore is None:
+        logger.error("Concurrency semaphore not initialized")
+        metrics.record_error("semaphore_not_initialized")
+        raise HTTPException(
+            status_code=503,
+            detail="Service not ready",
+        )
+    
+    # Try to acquire semaphore with timeout
+    try:
+        acquired = await asyncio.wait_for(
+            inference_semaphore.acquire(), 
+            timeout=5.0
+        )
+        if not acquired:
+            metrics.record_error("overloaded")
+            raise HTTPException(
+                status_code=503,
+                detail="Service temporarily unavailable - too many concurrent requests",
+            )
+    except asyncio.TimeoutError:
+        metrics.record_error("overloaded")
+        raise HTTPException(
+            status_code=429,
+            detail="Service overloaded - please try again later",
+        )
+    
+    try:
+        # Increment active requests counter
+        active_requests_count += 1
+        
+        # Lazy load model if not loaded
+        if not inference_engine.is_loaded():
+            try:
+                logger.info("Loading model on first request")
+                inference_engine.load_model()
+            except Exception as e:
+                logger.error(f"Failed to load model: {e}")
+                metrics.record_error("model_load_failed")
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Failed to load model: {str(e)}",
+                )
+        
+        async def token_generator():
+            """Async generator for streaming tokens."""
+            try:
+                for chunk in inference_engine.generate_stream(
+                    prompt=request.prompt,
+                    max_new_tokens=request.max_tokens,
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    do_sample=request.do_sample,
+                ):
+                    if chunk.get("type") == "completion":
+                        # Final completion data
+                        data = f"data: {json.dumps(chunk)}\n\n"
+                        yield data
+                        break
+                    else:
+                        # Individual token
+                        data = f"data: {json.dumps(chunk)}\n\n"
+                        yield data
+                        
+            except Exception as e:
+                logger.error(f"Streaming generation failed: {e}")
+                error_data = {
+                    "type": "error",
+                    "error": str(e),
+                    "error_type": "generation_failed"
+                }
+                yield f"data: {json.dumps(error_data)}\n\n"
+        
+        return StreamingResponse(
+            token_generator(),
+            media_type="text/plain",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Content-Type": "text/plain; charset=utf-8",
+            }
+        )
+        
+    except torch.cuda.OutOfMemoryError as e:
+        logger.error("Out of memory during streaming generation")
+        metrics.record_error("oom")
+        torch.cuda.empty_cache()
+        raise HTTPException(
+            status_code=507,
+            detail="Insufficient GPU memory. Try reducing max_tokens or enabling 8-bit quantization.",
+        )
+        
+    except Exception as e:
+        logger.error(f"Streaming generation failed: {e}", exc_info=True)
+        metrics.record_error("generation_failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Generation failed: {str(e)}",
+        )
+    finally:
+        # Always release the semaphore
+        if inference_semaphore:
+            inference_semaphore.release()
+        # Always decrement active requests counter
+        active_requests_count -= 1
 
 
 @app.get("/metrics", tags=["Metrics"])
