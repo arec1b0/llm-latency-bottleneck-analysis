@@ -357,3 +357,33 @@ class BatchGenerateResponse(BaseModel):
             ]
         }
     }
+
+
+# Streaming response models
+class StreamToken(BaseModel):
+    """Single token in streaming response"""
+    token: str = Field(..., description="Generated token text")
+    text: str = Field(..., description="Accumulated generated text")
+    finished: bool = Field(..., description="Whether generation is complete")
+    metrics: Dict[str, Any] = Field(..., description="Current generation metrics")
+
+
+class StreamGenerateRequest(BaseModel):
+    """Request for streaming text generation"""
+    prompt: str = Field(..., description="Input text prompt", min_length=1, max_length=4096)
+    max_tokens: int = Field(256, description="Maximum number of new tokens to generate", ge=1, le=1024)
+    temperature: float = Field(0.7, description="Sampling temperature", ge=0.0, le=2.0)
+    top_p: float = Field(0.9, description="Nucleus sampling parameter", ge=0.0, le=1.0)
+    do_sample: bool = Field(True, description="Whether to use sampling")
+    
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "prompt": "The future of AI is",
+                "max_tokens": 100,
+                "temperature": 0.8,
+                "top_p": 0.95,
+                "do_sample": True
+            }
+        }
+    }

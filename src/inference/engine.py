@@ -8,7 +8,7 @@ Loads model, manages generation, and tracks detailed timing metrics.
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional, Iterator
+from typing import Any, Dict, List, Optional, Iterator, Generator
 from pathlib import Path
 
 import torch
@@ -17,6 +17,7 @@ from transformers import (
     AutoModelForCausalLM,
     BitsAndBytesConfig,
     GenerationConfig,
+    TextStreamer,
 )
 from opentelemetry import trace
 
@@ -688,6 +689,190 @@ class InferenceEngine:
                 span.set_attribute("error", True)
                 span.record_exception(e)
                 self.metrics.record_error("generation_failed")
+                raise
+                
+            finally:
+                self.metrics.decrement_active_requests()
+
+    def generate_stream(
+        self,
+        prompt: str,
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        do_sample: bool = True,
+        **kwargs
+    ) -> Generator[Dict[str, Any], None, None]:
+        """
+        Generate text with streaming output and comprehensive metrics.
+        
+        Args:
+            prompt: Input text prompt
+            max_new_tokens: Maximum number of new tokens to generate
+            temperature: Sampling temperature
+            top_p: Nucleus sampling parameter
+            do_sample: Whether to use sampling
+            **kwargs: Additional generation parameters
+            
+        Yields:
+            Dict containing:
+            - token: Generated token
+            - text: Accumulated generated text
+            - finished: Whether generation is complete
+            - metrics: Current generation metrics
+        """
+        if not self._model_loaded:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+            
+        self.metrics.increment_active_requests()
+        start_time = time.time()
+        
+        with self.tracer.start_as_current_span("generate_stream") as span:
+            try:
+                # Set span attributes
+                span.set_attribute("llm.prompt_length", len(prompt))
+                span.set_attribute("llm.max_new_tokens", max_new_tokens)
+                span.set_attribute("llm.temperature", temperature)
+                span.set_attribute("llm.top_p", top_p)
+                
+                # Tokenize input
+                inputs = self.tokenizer(
+                    prompt, 
+                    return_tensors="pt", 
+                    truncation=True, 
+                    max_length=self.max_length
+                )
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                
+                # Generation config
+                generation_config = GenerationConfig(
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=do_sample,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    **kwargs
+                )
+                
+                # Custom streamer for token-by-token generation
+                class MetricsStreamer(TextStreamer):
+                    def __init__(self, tokenizer, metrics_collector, tracer, span):
+                        super().__init__(tokenizer, skip_prompt=True)
+                        self.metrics = metrics_collector
+                        self.tracer = tracer
+                        self.span = span
+                        self.token_times = []
+                        self.first_token_time = None
+                        self.start_time = time.time()
+                        
+                    def on_finalized_text(self, text: str, stream_end: bool = False):
+                        current_time = time.time()
+                        
+                        if self.first_token_time is None:
+                            self.first_token_time = current_time - self.start_time
+                            self.span.set_attribute("llm.first_token_time", self.first_token_time)
+                            
+                        self.token_times.append(current_time)
+                        
+                        # Calculate TPOT for tokens after the first
+                        if len(self.token_times) > 1:
+                            recent_times = self.token_times[-10:]  # Last 10 tokens
+                            tpot = sum(recent_times[i] - recent_times[i-1] for i in range(1, len(recent_times))) / (len(recent_times) - 1)
+                            self.span.set_attribute("llm.tpot", tpot)
+                
+                # Create streamer
+                streamer = MetricsStreamer(
+                    self.tokenizer, 
+                    self.metrics, 
+                    self.tracer, 
+                    span
+                )
+                
+                # Generate with streaming
+                accumulated_text = ""
+                token_count = 0
+                
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        **inputs,
+                        generation_config=generation_config,
+                        return_dict_in_generate=True,
+                        output_scores=True,
+                        streamer=streamer
+                    )
+                
+                # Extract generated sequence
+                generated_ids = outputs.sequences[0][inputs["input_ids"].shape[1]:]
+                
+                # Yield tokens one by one
+                for i, token_id in enumerate(generated_ids):
+                    token_text = self.tokenizer.decode(token_id, skip_special_tokens=True)
+                    accumulated_text += token_text
+                    token_count += 1
+                    
+                    # Calculate metrics
+                    current_time = time.time()
+                    total_time = current_time - start_time
+                    ttft = streamer.first_token_time if streamer.first_token_time else total_time
+                    tpot = (total_time - ttft) / max(token_count - 1, 1) if token_count > 1 else 0
+                    throughput = token_count / total_time if total_time > 0 else 0
+                    
+                    yield {
+                        "token": token_text,
+                        "text": accumulated_text,
+                        "finished": i == len(generated_ids) - 1,
+                        "metrics": {
+                            "token_index": i,
+                            "total_tokens": token_count,
+                            "ttft": ttft,
+                            "tpot": tpot,
+                            "total_time": total_time,
+                            "throughput_tokens_per_sec": throughput,
+                            "prompt_tokens": inputs["input_ids"].shape[1],
+                            "completion_tokens": token_count,
+                        }
+                    }
+                
+                # Record final metrics
+                total_time = time.time() - start_time
+                final_metrics = {
+                    "prompt_tokens": inputs["input_ids"].shape[1],
+                    "completion_tokens": len(generated_ids),
+                    "total_tokens": inputs["input_ids"].shape[1] + len(generated_ids),
+                    "ttft": streamer.first_token_time if streamer.first_token_time else total_time,
+                    "tpot": (total_time - (streamer.first_token_time or 0)) / max(len(generated_ids) - 1, 1),
+                    "total_time": total_time,
+                    "throughput_tokens_per_sec": len(generated_ids) / total_time if total_time > 0 else 0,
+                }
+                
+                # Record metrics
+                self.metrics.record_inference_metrics(
+                    prompt_tokens=final_metrics["prompt_tokens"],
+                    completion_tokens=final_metrics["completion_tokens"],
+                    total_time=final_metrics["total_time"],
+                    ttft=final_metrics["ttft"],
+                    tpot=final_metrics["tpot"]
+                )
+                
+                # Set final span attributes
+                span.set_attribute("llm.prompt_tokens", final_metrics["prompt_tokens"])
+                span.set_attribute("llm.completion_tokens", final_metrics["completion_tokens"])
+                span.set_attribute("llm.total_time", final_metrics["total_time"])
+                span.set_attribute("llm.throughput", final_metrics["throughput_tokens_per_sec"])
+                
+                logger.info(
+                    f"Streaming generation completed: "
+                    f"{final_metrics['completion_tokens']} tokens in "
+                    f"{final_metrics['total_time']:.2f}s "
+                    f"(TTFT: {final_metrics['ttft']:.3f}s, "
+                    f"TPOT: {final_metrics['tpot']:.3f}s)"
+                )
+                
+            except Exception as e:
+                logger.error(f"Streaming generation failed: {e}")
+                span.record_exception(e)
+                self.metrics.record_error("streaming_generation_failed")
                 raise
                 
             finally:

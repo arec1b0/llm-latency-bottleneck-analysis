@@ -1,0 +1,242 @@
+# Alertmanager configuration for LLM Inference Service
+# Handles alert routing, grouping, and notification delivery
+
+global:
+  # Default SMTP configuration for email notifications
+  smtp_smarthost: 'smtp.gmail.com:587'
+  smtp_from: 'alerts@example.com'
+  smtp_auth_username: 'alerts@example.com'
+  smtp_auth_password: '${SMTP_PASSWORD}'
+  smtp_require_tls: true
+  
+  # Slack webhook URL (if using Slack)
+  slack_api_url: '${SLACK_WEBHOOK_URL}'
+  
+  # PagerDuty integration key (if using PagerDuty)
+  pagerduty_url: 'https://events.pagerduty.com/v2/enqueue'
+
+# Templates for alert notifications
+templates:
+  - '/etc/alertmanager/templates/*.tmpl'
+
+# Route tree for alert routing
+route:
+  # Default receiver for all alerts
+  receiver: 'default-receiver'
+  
+  # Group alerts by these labels
+  group_by: ['alertname', 'service', 'severity']
+  
+  # Wait time before sending initial notification
+  group_wait: 10s
+  
+  # Wait time before sending notification about new alerts in group
+  group_interval: 10s
+  
+  # Wait time before re-sending notification
+  repeat_interval: 3h
+  
+  # Child routes with specific matchers
+  routes:
+    # Critical alerts - immediate notification
+    - match:
+        severity: critical
+      receiver: 'critical-alerts'
+      group_wait: 5s
+      repeat_interval: 30m
+      continue: true
+    
+    # Warning alerts - less urgent
+    - match:
+        severity: warning
+      receiver: 'warning-alerts'
+      group_wait: 30s
+      repeat_interval: 4h
+    
+    # Service-specific routes
+    - match:
+        service: llm-inference
+      receiver: 'llm-team'
+      routes:
+        # Critical LLM service alerts
+        - match:
+            severity: critical
+          receiver: 'llm-oncall'
+          group_wait: 5s
+          repeat_interval: 15m
+    
+    # Infrastructure alerts
+    - match:
+        service: infrastructure
+      receiver: 'infrastructure-team'
+    
+    # Monitoring service alerts
+    - match:
+        service: monitoring
+      receiver: 'monitoring-team'
+
+# Inhibition rules - suppress certain alerts when others are firing
+inhibit_rules:
+  # Inhibit warning alerts if critical alert is firing for same service
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['service', 'alertname']
+  
+  # Inhibit downstream alerts when service is down
+  - source_match:
+      alertname: 'LLMServiceDown'
+    target_match_re:
+      alertname: '(HighTTFT|LowThroughput|HighErrorRate).*'
+    equal: ['service']
+  
+  # Inhibit performance alerts when GPU memory is critical
+  - source_match:
+      alertname: 'CriticalGPUMemoryUsage'
+    target_match_re:
+      alertname: '(HighTTFT|LowThroughput).*'
+    equal: ['service']
+
+# Receivers - define how to send notifications
+receivers:
+  # Default receiver
+  - name: 'default-receiver'
+    email_configs:
+      - to: 'team@example.com'
+        headers:
+          Subject: '[{{ .Status | toUpper }}] {{ .GroupLabels.alertname }}'
+        html: |
+          <h2>Alert: {{ .GroupLabels.alertname }}</h2>
+          <p><strong>Status:</strong> {{ .Status }}</p>
+          <p><strong>Severity:</strong> {{ .GroupLabels.severity }}</p>
+          <p><strong>Service:</strong> {{ .GroupLabels.service }}</p>
+          <h3>Alerts:</h3>
+          {{ range .Alerts }}
+          <p>
+            <strong>{{ .Labels.alertname }}</strong><br>
+            {{ .Annotations.summary }}<br>
+            {{ .Annotations.description }}<br>
+            <a href="{{ .Annotations.runbook_url }}">Runbook</a>
+          </p>
+          {{ end }}
+  
+  # Critical alerts - multiple channels
+  - name: 'critical-alerts'
+    email_configs:
+      - to: 'oncall@example.com'
+        headers:
+          Subject: '[CRITICAL] {{ .GroupLabels.alertname }}'
+        send_resolved: true
+    
+    slack_configs:
+      - channel: '#alerts-critical'
+        title: '[CRITICAL] {{ .GroupLabels.alertname }}'
+        text: |
+          {{ range .Alerts }}
+          *Alert:* {{ .Labels.alertname }}
+          *Service:* {{ .Labels.service }}
+          *Summary:* {{ .Annotations.summary }}
+          *Description:* {{ .Annotations.description }}
+          {{ if .Annotations.runbook_url }}*Runbook:* {{ .Annotations.runbook_url }}{{ end }}
+          {{ end }}
+        send_resolved: true
+    
+    pagerduty_configs:
+      - service_key: '${PAGERDUTY_SERVICE_KEY}'
+        description: '{{ .GroupLabels.alertname }}: {{ .GroupLabels.service }}'
+        details:
+          firing: '{{ .Alerts.Firing | len }}'
+          resolved: '{{ .Alerts.Resolved | len }}'
+        severity: 'critical'
+  
+  # Warning alerts
+  - name: 'warning-alerts'
+    email_configs:
+      - to: 'team@example.com'
+        headers:
+          Subject: '[WARNING] {{ .GroupLabels.alertname }}'
+        send_resolved: true
+    
+    slack_configs:
+      - channel: '#alerts-warning'
+        title: '[WARNING] {{ .GroupLabels.alertname }}'
+        text: |
+          {{ range .Alerts }}
+          *Alert:* {{ .Labels.alertname }}
+          *Service:* {{ .Labels.service }}
+          *Summary:* {{ .Annotations.summary }}
+          {{ end }}
+        send_resolved: true
+  
+  # LLM team notifications
+  - name: 'llm-team'
+    email_configs:
+      - to: 'llm-team@example.com'
+        headers:
+          Subject: '[LLM Service] {{ .GroupLabels.alertname }}'
+        send_resolved: true
+    
+    slack_configs:
+      - channel: '#llm-service'
+        title: '{{ .GroupLabels.alertname }}'
+        text: |
+          {{ range .Alerts }}
+          *Alert:* {{ .Labels.alertname }}
+          *Severity:* {{ .Labels.severity }}
+          *Summary:* {{ .Annotations.summary }}
+          *Description:* {{ .Annotations.description }}
+          {{ end }}
+        send_resolved: true
+  
+  # LLM on-call - critical only
+  - name: 'llm-oncall'
+    email_configs:
+      - to: 'llm-oncall@example.com'
+        headers:
+          Subject: '[CRITICAL - LLM Service] {{ .GroupLabels.alertname }}'
+        send_resolved: true
+    
+    slack_configs:
+      - channel: '#llm-oncall'
+        title: '[CRITICAL] {{ .GroupLabels.alertname }}'
+        text: |
+          @channel - Critical LLM Service Alert
+          {{ range .Alerts }}
+          *Alert:* {{ .Labels.alertname }}
+          *Summary:* {{ .Annotations.summary }}
+          *Description:* {{ .Annotations.description }}
+          {{ if .Annotations.runbook_url }}*Runbook:* {{ .Annotations.runbook_url }}{{ end }}
+          {{ end }}
+        send_resolved: true
+    
+    pagerduty_configs:
+      - service_key: '${PAGERDUTY_LLM_SERVICE_KEY}'
+        description: 'Critical LLM Service Alert: {{ .GroupLabels.alertname }}'
+        severity: 'critical'
+  
+  # Infrastructure team
+  - name: 'infrastructure-team'
+    email_configs:
+      - to: 'infra-team@example.com'
+        headers:
+          Subject: '[Infrastructure] {{ .GroupLabels.alertname }}'
+        send_resolved: true
+    
+    slack_configs:
+      - channel: '#infrastructure'
+        title: '{{ .GroupLabels.alertname }}'
+        send_resolved: true
+  
+  # Monitoring team
+  - name: 'monitoring-team'
+    email_configs:
+      - to: 'monitoring-team@example.com'
+        headers:
+          Subject: '[Monitoring] {{ .GroupLabels.alertname }}'
+        send_resolved: true
+    
+    slack_configs:
+      - channel: '#monitoring'
+        title: '{{ .GroupLabels.alertname }}'
+        send_resolved: true

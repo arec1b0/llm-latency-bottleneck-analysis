@@ -53,6 +53,8 @@ services:
       - "9090:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ../monitoring/production-alerts.yml:/etc/prometheus/alerts/production-alerts.yml
+      - prometheus-data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
@@ -82,8 +84,31 @@ services:
     depends_on:
       - prometheus
 
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    container_name: alertmanager-llm
+    ports:
+      - "9093:9093"
+    volumes:
+      - ../monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+      - alertmanager-data:/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+      - '--web.external-url=http://localhost:9093'
+    networks:
+      - llm-network
+    restart: unless-stopped
+    environment:
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-changeme}
+      - SLACK_WEBHOOK_URL=${SLACK_WEBHOOK_URL:-}
+      - PAGERDUTY_SERVICE_KEY=${PAGERDUTY_SERVICE_KEY:-}
+      - PAGERDUTY_LLM_SERVICE_KEY=${PAGERDUTY_LLM_SERVICE_KEY:-}
+
 volumes:
   grafana-storage:
+  prometheus-data:
+  alertmanager-data:
 
 
 networks:

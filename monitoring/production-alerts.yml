@@ -1,0 +1,249 @@
+# Production alerting rules for LLM Inference Service
+# Configured for Prometheus Alertmanager
+
+groups:
+  - name: llm-inference-health
+    rules:
+      # Service health alerts
+      - alert: LLMServiceDown
+        expr: up{job="llm-inference"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: llm-inference
+        annotations:
+          summary: "LLM Inference service is down"
+          description: "LLM Inference service has been down for more than 1 minute"
+          runbook_url: "https://docs.example.com/runbooks/llm-service-down"
+
+      - alert: LLMServiceUnhealthy
+        expr: llm_health_status != 1
+        for: 2m
+        labels:
+          severity: warning
+          service: llm-inference
+        annotations:
+          summary: "LLM Inference service health check failing"
+          description: "Health check endpoint returning unhealthy status for 2 minutes"
+
+      - alert: ModelNotLoaded
+        expr: llm_model_loaded == 0
+        for: 5m
+        labels:
+          severity: critical
+          service: llm-inference
+        annotations:
+          summary: "Model not loaded in inference engine"
+          description: "Model has not been loaded for more than 5 minutes"
+
+  - name: llm-performance
+    rules:
+      # Performance alerts
+      - alert: HighTTFT
+        expr: llm_ttft_seconds > 2.0
+        for: 5m
+        labels:
+          severity: warning
+          service: llm-inference
+        annotations:
+          summary: "High Time To First Token (TTFT)"
+          description: "TTFT is {{ $value }}s, which is above the 2s threshold for 5 minutes"
+
+      - alert: VeryHighTTFT
+        expr: llm_ttft_seconds > 5.0
+        for: 2m
+        labels:
+          severity: critical
+          service: llm-inference
+        annotations:
+          summary: "Very High Time To First Token (TTFT)"
+          description: "TTFT is {{ $value }}s, which is critically high"
+
+      - alert: LowThroughput
+        expr: rate(llm_tokens_generated_total[5m]) < 10
+        for: 10m
+        labels:
+          severity: warning
+          service: llm-inference
+        annotations:
+          summary: "Low token generation throughput"
+          description: "Token generation rate is {{ $value }} tokens/sec, below expected threshold"
+
+      - alert: VeryLowThroughput
+        expr: rate(llm_tokens_generated_total[5m]) < 5
+        for: 5m
+        labels:
+          severity: critical
+          service: llm-inference
+        annotations:
+          summary: "Very low token generation throughput"
+          description: "Token generation rate is critically low at {{ $value }} tokens/sec"
+
+      - alert: HighErrorRate
+        expr: rate(llm_requests_failed_total[5m]) / rate(llm_requests_total[5m]) > 0.05
+        for: 3m
+        labels:
+          severity: warning
+          service: llm-inference
+        annotations:
+          summary: "High error rate"
+          description: "Error rate is {{ $value | humanizePercentage }}, above 5% threshold"
+
+      - alert: VeryHighErrorRate
+        expr: rate(llm_requests_failed_total[5m]) / rate(llm_requests_total[5m]) > 0.10
+        for: 1m
+        labels:
+          severity: critical
+          service: llm-inference
+        annotations:
+          summary: "Very high error rate"
+          description: "Error rate is critically high at {{ $value | humanizePercentage }}"
+
+  - name: llm-resources
+    rules:
+      # Resource utilization alerts
+      - alert: HighGPUUtilization
+        expr: nvidia_gpu_utilization_gpu > 0.90
+        for: 10m
+        labels:
+          severity: warning
+          service: llm-inference
+        annotations:
+          summary: "High GPU utilization"
+          description: "GPU utilization is {{ $value | humanizePercentage }}, sustained above 90%"
+
+      - alert: HighGPUMemoryUsage
+        expr: nvidia_gpu_memory_used_bytes / nvidia_gpu_memory_total_bytes > 0.85
+        for: 5m
+        labels:
+          severity: warning
+          service: llm-inference
+        annotations:
+          summary: "High GPU memory usage"
+          description: "GPU memory usage is {{ $value | humanizePercentage }}, above 85% threshold"
+
+      - alert: CriticalGPUMemoryUsage
+        expr: nvidia_gpu_memory_used_bytes / nvidia_gpu_memory_total_bytes > 0.95
+        for: 2m
+        labels:
+          severity: critical
+          service: llm-inference
+        annotations:
+          summary: "Critical GPU memory usage"
+          description: "GPU memory usage is critically high at {{ $value | humanizePercentage }}"
+
+      - alert: HighCPUUsage
+        expr: rate(container_cpu_usage_seconds_total{name="llm-inference"}[5m]) > 0.80
+        for: 10m
+        labels:
+          severity: warning
+          service: llm-inference
+        annotations:
+          summary: "High CPU usage"
+          description: "CPU usage is {{ $value | humanizePercentage }}, sustained above 80%"
+
+      - alert: HighMemoryUsage
+        expr: container_memory_usage_bytes{name="llm-inference"} / container_spec_memory_limit_bytes{name="llm-inference"} > 0.85
+        for: 10m
+        labels:
+          severity: warning
+          service: llm-inference
+        annotations:
+          summary: "High memory usage"
+          description: "Memory usage is {{ $value | humanizePercentage }}, above 85% threshold"
+
+  - name: llm-scaling
+    rules:
+      # Scaling and capacity alerts
+      - alert: HighActiveRequests
+        expr: llm_active_requests > 10
+        for: 5m
+        labels:
+          severity: warning
+          service: llm-inference
+        annotations:
+          summary: "High number of active requests"
+          description: "{{ $value }} active requests, may need to scale up"
+
+      - alert: VeryHighActiveRequests
+        expr: llm_active_requests > 20
+        for: 2m
+        labels:
+          severity: critical
+          service: llm-inference
+        annotations:
+          summary: "Very high number of active requests"
+          description: "{{ $value }} active requests, service may be overloaded"
+
+      - alert: RequestQueueBuilding
+        expr: llm_request_queue_depth > 5
+        for: 3m
+        labels:
+          severity: warning
+          service: llm-inference
+        annotations:
+          summary: "Request queue building up"
+          description: "Request queue depth is {{ $value }}, requests are backing up"
+
+      - alert: HighRequestLatency
+        expr: histogram_quantile(0.95, rate(llm_request_duration_seconds_bucket[5m])) > 10
+        for: 5m
+        labels:
+          severity: warning
+          service: llm-inference
+        annotations:
+          summary: "High 95th percentile request latency"
+          description: "95th percentile latency is {{ $value }}s, above 10s threshold"
+
+  - name: llm-infra
+    rules:
+      # Infrastructure alerts
+      - alert: PrometheusDown
+        expr: up{job="prometheus"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: monitoring
+        annotations:
+          summary: "Prometheus is down"
+          description: "Prometheus monitoring service is unavailable"
+
+      - alert: GrafanaDown
+        expr: up{job="grafana"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          service: monitoring
+        annotations:
+          summary: "Grafana is down"
+          description: "Grafana dashboard service is unavailable"
+
+      - alert: JaegerDown
+        expr: up{job="jaeger"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          service: monitoring
+        annotations:
+          summary: "Jaeger is down"
+          description: "Jaeger tracing service is unavailable"
+
+      - alert: DiskSpaceLow
+        expr: (node_filesystem_avail_bytes / node_filesystem_size_bytes) < 0.10
+        for: 5m
+        labels:
+          severity: warning
+          service: infrastructure
+        annotations:
+          summary: "Low disk space"
+          description: "Disk space is {{ $value | humanizePercentage }}, below 10% threshold"
+
+      - alert: DiskSpaceCritical
+        expr: (node_filesystem_avail_bytes / node_filesystem_size_bytes) < 0.05
+        for: 2m
+        labels:
+          severity: critical
+          service: infrastructure
+        annotations:
+          summary: "Critical disk space"
+          description: "Disk space is critically low at {{ $value | humanizePercentage }}"

@@ -27,6 +27,8 @@ from .models import (
     MetricsSnapshot,
     BatchGenerateRequest,
     BatchGenerateResponse,
+    StreamGenerateRequest,
+    StreamToken,
 )
 from ..inference import InferenceEngine
 from ..telemetry import setup_telemetry, shutdown_telemetry, MetricsCollector
@@ -676,6 +678,72 @@ async def unload_model():
             status_code=500,
             detail=f"Failed to unload model: {str(e)}",
         )
+
+
+@app.post("/generate_stream", response_class=StreamingResponse, tags=["Generation"])
+async def generate_text_stream(request: StreamGenerateRequest):
+    """
+    Generate text with streaming output.
+    
+    Provides real-time token-by-token generation with comprehensive metrics.
+    Returns Server-Sent Events (SSE) format for easy client consumption.
+    """
+    global inference_engine, inference_semaphore
+    
+    if not inference_engine:
+        raise HTTPException(
+            status_code=503,
+            detail="Inference engine not initialized",
+        )
+    
+    if not inference_engine.is_loaded():
+        inference_engine.load_model()
+    
+    async def stream_generator():
+        """Async generator for streaming responses"""
+        try:
+            # Acquire semaphore for concurrency control
+            if inference_semaphore:
+                await inference_semaphore.acquire()
+            
+            # Generate with streaming
+            for token_data in inference_engine.generate_stream(
+                prompt=request.prompt,
+                max_new_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                do_sample=request.do_sample,
+            ):
+                # Convert to SSE format
+                yield f"data: {json.dumps(token_data)}\n\n"
+                
+                # Break if finished
+                if token_data.get("finished", False):
+                    break
+                    
+        except Exception as e:
+            logger.error(f"Streaming generation failed: {e}")
+            error_data = {
+                "error": True,
+                "message": str(e),
+                "finished": True
+            }
+            yield f"data: {json.dumps(error_data)}\n\n"
+            
+        finally:
+            # Release semaphore
+            if inference_semaphore:
+                inference_semaphore.release()
+    
+    return StreamingResponse(
+        stream_generator(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        }
+    )
 
 
 if __name__ == "__main__":
