@@ -244,3 +244,116 @@ class MetricsSnapshot(BaseModel):
         description="Current GPU memory usage in MB",
         ge=0.0,
     )
+
+
+class BatchGenerateRequest(BaseModel):
+    """Request model for batch text generation."""
+    
+    prompts: List[str] = Field(
+        ...,
+        description="List of input prompts for batch generation",
+        min_items=1,
+        max_items=32,
+    )
+    
+    max_tokens: int = Field(
+        default=256,
+        description="Maximum number of tokens to generate per prompt",
+        ge=1,
+        le=2048,
+    )
+    
+    temperature: float = Field(
+        default=0.7,
+        description="Sampling temperature",
+        ge=0.0,
+        le=2.0,
+    )
+    
+    top_p: float = Field(
+        default=0.9,
+        description="Nucleus sampling probability",
+        ge=0.0,
+        le=1.0,
+    )
+    
+    do_sample: bool = Field(
+        default=True,
+        description="Enable sampling (vs greedy generation)",
+    )
+    
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "prompts": [
+                        "The future of AI is",
+                        "Machine learning models",
+                        "Natural language processing"
+                    ],
+                    "max_tokens": 128,
+                    "temperature": 0.8,
+                    "top_p": 0.9,
+                    "do_sample": True,
+                }
+            ]
+        }
+    }
+
+
+class BatchGenerateResponse(BaseModel):
+    """Response model for batch text generation."""
+    
+    results: List[GenerateResponse] = Field(
+        ...,
+        description="List of generation results",
+    )
+    
+    batch_size: int = Field(
+        ...,
+        description="Number of prompts in the batch",
+        ge=1,
+    )
+    
+    total_tokens: int = Field(
+        ...,
+        description="Total tokens generated across all prompts",
+        ge=0,
+    )
+    
+    total_time: float = Field(
+        ...,
+        description="Total time for batch generation in seconds",
+        ge=0.0,
+    )
+    
+    throughput_tokens_per_sec: float = Field(
+        ...,
+        description="Average throughput in tokens per second",
+        ge=0.0,
+    )
+    
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "results": [
+                        {
+                            "generated_text": "bright and full of possibilities.",
+                            "prompt_tokens": 6,
+                            "completion_tokens": 7,
+                            "total_tokens": 13,
+                            "ttft": 0.456,
+                            "tpot": 0.032,
+                            "total_time": 0.680,
+                            "throughput_tokens_per_sec": 19.1,
+                        }
+                    ],
+                    "batch_size": 1,
+                    "total_tokens": 13,
+                    "total_time": 0.680,
+                    "throughput_tokens_per_sec": 19.1,
+                }
+            ]
+        }
+    }

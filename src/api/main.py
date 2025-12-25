@@ -4,10 +4,11 @@ FastAPI Application
 Main API server with comprehensive OpenTelemetry instrumentation.
 """
 
-import logging
-import os
 import asyncio
 import json
+import logging
+import os
+import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -22,7 +23,10 @@ from .models import (
     GenerateRequest,
     GenerateResponse,
     HealthResponse,
-    ErrorResponse,
+    ModelInfo,
+    MetricsSnapshot,
+    BatchGenerateRequest,
+    BatchGenerateResponse,
 )
 from ..inference import InferenceEngine
 from ..telemetry import setup_telemetry, shutdown_telemetry, MetricsCollector
@@ -482,6 +486,120 @@ async def get_metrics():
     """
     metrics_data, content_type = MetricsCollector.get_metrics_response()
     return Response(content=metrics_data, media_type=content_type)
+
+
+@app.post("/generate_batch", response_model=BatchGenerateResponse, tags=["Generation"])
+async def generate_text_batch(request: BatchGenerateRequest):
+    """
+    Generate text for multiple prompts in batch for improved throughput.
+    
+    Processes multiple prompts together for better GPU utilization and throughput.
+    Returns individual results for each prompt along with batch-level metrics.
+    
+    Args:
+        request: Batch generation request with multiple prompts
+    
+    Returns:
+        BatchGenerateResponse: Individual results and batch metrics
+    
+    Raises:
+        HTTPException: If model not loaded, service overloaded, or generation fails
+    """
+    global inference_engine, inference_semaphore, active_requests_count
+    
+    if not inference_engine:
+        raise HTTPException(status_code=503, detail="Inference engine not initialized")
+    
+    # Check batch size limit
+    if len(request.prompts) > 32:
+        raise HTTPException(
+            status_code=400,
+            detail="Batch size too large (max 32 prompts)"
+        )
+    
+    # Acquire semaphore for batch (count as one request)
+    if inference_semaphore:
+        try:
+            await asyncio.wait_for(inference_semaphore.acquire(), timeout=5.0)
+        except asyncio.TimeoutError:
+            metrics.record_error("overloaded")
+            raise HTTPException(
+                status_code=429,
+                detail="Service overloaded - please try again later",
+            )
+    
+    try:
+        # Increment active requests counter
+        active_requests_count += 1
+        
+        # Lazy load model if not loaded
+        if not inference_engine.is_loaded():
+            try:
+                logger.info("Loading model on first batch request")
+                inference_engine.load_model()
+            except Exception as e:
+                logger.error(f"Failed to load model: {e}")
+                metrics.record_error("model_load_failed")
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Failed to load model: {str(e)}",
+                )
+        
+        # Generate in batch
+        start_time = time.time()
+        results = inference_engine.generate_batch(
+            prompts=request.prompts,
+            max_new_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            do_sample=request.do_sample,
+        )
+        total_time = time.time() - start_time
+        
+        # Convert to response format
+        generate_responses = [GenerateResponse(**result) for result in results]
+        
+        # Calculate batch metrics
+        total_tokens = sum(r.total_tokens for r in generate_responses)
+        throughput = total_tokens / total_time
+        
+        batch_response = BatchGenerateResponse(
+            results=generate_responses,
+            batch_size=len(request.prompts),
+            total_tokens=total_tokens,
+            total_time=total_time,
+            throughput_tokens_per_sec=throughput,
+        )
+        
+        logger.info(
+            f"Batch generation completed - Size: {len(request.prompts)}, "
+            f"Tokens: {total_tokens}, "
+            f"Throughput: {throughput:.1f} tokens/sec"
+        )
+        
+        return batch_response
+        
+    except torch.cuda.OutOfMemoryError as e:
+        logger.error("Out of memory error during batch generation")
+        metrics.record_error("oom")
+        raise HTTPException(
+            status_code=507,
+            detail="Insufficient GPU memory for batch. Try smaller batch size or enable 8-bit quantization.",
+        )
+        
+    except Exception as e:
+        logger.error(f"Batch generation failed: {e}", exc_info=True)
+        metrics.record_error("generation_failed")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Generation failed: {str(e)}",
+        )
+    finally:
+        # Always release the semaphore
+        if inference_semaphore:
+            inference_semaphore.release()
+        # Always decrement active requests counter
+        active_requests_count -= 1
 
 
 @app.get("/model/info", tags=["Model"])

@@ -1,4 +1,21 @@
 services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.88.0
+    container_name: otel-collector-llm
+    command: [ "--config=/etc/otel-collector-config.yaml" ]
+    volumes:
+      - ./otel-collector/otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317" # OTLP gRPC receiver
+      - "4318:4318" # OTLP HTTP receiver
+      - "8888:8888" # Prometheus metrics
+      - "8889:8889" # Prometheus exporter metrics
+    networks:
+      - llm-network
+    restart: unless-stopped
+    depends_on:
+      - jaeger
+
   jaeger:
     image: jaegertracing/all-in-one:1.51
     container_name: jaeger-llm-tracing
@@ -23,7 +40,7 @@ services:
       - llm-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:16686/"]
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:16686/" ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -45,6 +62,29 @@ services:
     networks:
       - llm-network
     restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.2.2
+    container_name: grafana-llm-dashboard
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - grafana-storage:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    networks:
+      - llm-network
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+volumes:
+  grafana-storage:
+
 
 networks:
   llm-network:

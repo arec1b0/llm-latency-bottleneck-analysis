@@ -8,7 +8,7 @@ Loads model, manages generation, and tracks detailed timing metrics.
 import logging
 import os
 import time
-from typing import Optional, Dict, Any, Iterator
+from typing import Any, Dict, List, Optional, Iterator
 from pathlib import Path
 
 import torch
@@ -540,3 +540,155 @@ class InferenceEngine:
             info["gpu_memory_reserved_gb"] = torch.cuda.memory_reserved() / (1024 ** 3)
         
         return info
+    
+    def generate_batch(
+        self,
+        prompts: List[str],
+        max_new_tokens: int = 256,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        do_sample: bool = True,
+        **kwargs,
+    ) -> List[Dict[str, Any]]:
+        """
+        Generate text for multiple prompts in batch for improved throughput.
+        
+        Args:
+            prompts: List of input prompt texts
+            max_new_tokens: Maximum tokens to generate per prompt
+            temperature: Sampling temperature
+            top_p: Nucleus sampling probability
+            do_sample: Enable sampling (vs greedy)
+            **kwargs: Additional generation parameters
+        
+        Returns:
+            List of dictionaries with generated text and metrics
+        
+        Raises:
+            RuntimeError: If model is not loaded or generation fails
+        """
+        if not self._model_loaded:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+        
+        with self.tracer.start_as_current_span("generate_batch") as span:
+            span.set_attribute("batch.size", len(prompts))
+            span.set_attribute("generation.max_new_tokens", max_new_tokens)
+            span.set_attribute("generation.temperature", temperature)
+            
+            try:
+                self.metrics.increment_active_requests()
+                
+                # Tokenize all inputs in batch
+                with self.tracer.start_as_current_span("tokenize_batch") as tokenize_span:
+                    inputs = self.tokenizer(
+                        prompts,
+                        return_tensors="pt",
+                        padding=True,
+                        truncation=True,
+                        max_length=self.max_length,
+                    )
+                    inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                    prompt_tokens = inputs["input_ids"].shape[1]
+                    
+                    tokenize_span.set_attribute("prompt.tokens", prompt_tokens)
+                    span.set_attribute("prompt.tokens", prompt_tokens)
+                
+                # Configure generation
+                generation_config = GenerationConfig(
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=do_sample,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    **kwargs,
+                )
+                
+                # Start timing
+                timer = InferenceTimer(self.tracer)
+                timer.start("model_generate_batch")
+                
+                # Generate in batch
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        **inputs,
+                        generation_config=generation_config,
+                        return_dict_in_generate=True,
+                        output_scores=False,
+                    )
+                
+                # Stop timing
+                timings = timer.stop()
+                
+                # Process results
+                results = []
+                for i, prompt in enumerate(prompts):
+                    # Decode generated text for this prompt
+                    generated_ids = outputs.sequences[i]
+                    prompt_length = inputs["attention_mask"][i].sum().item()
+                    generated_ids_only = generated_ids[prompt_length:]
+                    
+                    generated_text = self.tokenizer.decode(
+                        generated_ids_only,
+                        skip_special_tokens=True,
+                    )
+                    
+                    completion_tokens = len(generated_ids_only)
+                    total_tokens = prompt_length + completion_tokens
+                    
+                    # Calculate metrics
+                    result = {
+                        "generated_text": generated_text,
+                        "prompt_tokens": prompt_length,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": total_tokens,
+                        "ttft": timings.first_token_time,
+                        "tpot": timings.average_tpot,
+                        "total_time": timings.total_time,
+                        "throughput_tokens_per_sec": total_tokens / timings.total_time,
+                    }
+                    results.append(result)
+                
+                # Record batch metrics
+                total_tokens = sum(r["total_tokens"] for r in results)
+                avg_ttft = sum(r["ttft"] for r in results) / len(results)
+                avg_tpot = sum(r["tpot"] for r in results) / len(results)
+                
+                batch_metrics = InferenceMetrics(
+                    ttft=avg_ttft,
+                    tpot=avg_tpot,
+                    total_tokens=total_tokens,
+                    prompt_tokens=sum(r["prompt_tokens"] for r in results),
+                    completion_tokens=sum(r["completion_tokens"] for r in results),
+                    total_time=timings.total_time,
+                    memory_used_mb=timer.memory_end_mb or 0.0,
+                    gpu_memory_used_mb=timer.gpu_memory_end_mb,
+                )
+                
+                self.metrics.record_inference_metrics(batch_metrics)
+                
+                logger.info(
+                    f"Batch generation completed - Batch size: {len(prompts)}, "
+                    f"Total tokens: {total_tokens}, "
+                    f"Avg TTFT: {avg_ttft:.3f}s, "
+                    f"Avg TPOT: {avg_tpot:.3f}s"
+                )
+                
+                return results
+                
+            except torch.cuda.OutOfMemoryError as e:
+                logger.error("Out of memory error during batch generation")
+                span.set_attribute("error", True)
+                span.record_exception(e)
+                self.metrics.record_error("oom")
+                raise
+                
+            except Exception as e:
+                logger.error(f"Batch generation failed: {e}")
+                span.set_attribute("error", True)
+                span.record_exception(e)
+                self.metrics.record_error("generation_failed")
+                raise
+                
+            finally:
+                self.metrics.decrement_active_requests()

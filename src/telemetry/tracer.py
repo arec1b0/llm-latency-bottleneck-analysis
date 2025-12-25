@@ -10,7 +10,7 @@ import os
 from typing import Optional
 
 from opentelemetry import trace
-from opentelemetry.exporter.jaeger.thrift import JaegerExporter
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -22,16 +22,14 @@ logger = logging.getLogger(__name__)
 
 def setup_telemetry(
     service_name: Optional[str] = None,
-    jaeger_host: Optional[str] = None,
-    jaeger_port: Optional[int] = None,
+    otlp_endpoint: Optional[str] = None,
 ) -> TracerProvider:
     """
-    Initialize OpenTelemetry tracing with Jaeger exporter.
+    Initialize OpenTelemetry tracing with OTLP exporter.
     
     Args:
         service_name: Name of the service for tracing (default: from env)
-        jaeger_host: Jaeger agent host (default: from env)
-        jaeger_port: Jaeger agent port (default: from env)
+        otlp_endpoint: OTLP collector endpoint (default: from env)
     
     Returns:
         TracerProvider: Configured tracer provider
@@ -41,12 +39,11 @@ def setup_telemetry(
     """
     # Get configuration from environment or parameters
     service_name = service_name or os.getenv("OTEL_SERVICE_NAME", "llm-inference-api")
-    jaeger_host = jaeger_host or os.getenv("OTEL_EXPORTER_JAEGER_AGENT_HOST", "localhost")
-    jaeger_port = jaeger_port or int(os.getenv("OTEL_EXPORTER_JAEGER_AGENT_PORT", "6831"))
+    otlp_endpoint = otlp_endpoint or os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
     
     logger.info(
         f"Initializing OpenTelemetry for service '{service_name}' "
-        f"with Jaeger at {jaeger_host}:{jaeger_port}"
+        f"with OTLP at {otlp_endpoint}"
     )
     
     # Create resource with service information
@@ -61,16 +58,16 @@ def setup_telemetry(
     # Create tracer provider
     tracer_provider = TracerProvider(resource=resource)
     
-    # Create Jaeger exporter
+    # Create OTLP exporter
     try:
-        jaeger_exporter = JaegerExporter(
-            agent_host_name=jaeger_host,
-            agent_port=jaeger_port,
+        otlp_exporter = OTLPSpanExporter(
+            endpoint=otlp_endpoint,
+            insecure=True,  # For local development
         )
         
         # Create batch span processor for efficient export
         span_processor = BatchSpanProcessor(
-            jaeger_exporter,
+            otlp_exporter,
             max_queue_size=2048,
             max_export_batch_size=512,
             schedule_delay_millis=5000,
@@ -78,11 +75,11 @@ def setup_telemetry(
         )
         
         tracer_provider.add_span_processor(span_processor)
-        logger.info("Jaeger exporter configured successfully")
+        logger.info("OTLP exporter configured successfully")
         
     except Exception as e:
-        logger.error(f"Failed to configure Jaeger exporter: {e}")
-        logger.warning("Continuing without Jaeger tracing")
+        logger.error(f"Failed to configure OTLP exporter: {e}")
+        logger.warning("Continuing without OTLP tracing")
         # Don't raise - allow system to continue without tracing
     
     # Set as global tracer provider
