@@ -353,10 +353,10 @@ rate(llm_errors_total[5m]) / rate(llm_requests_total[5m])
 - [x] Document findings (in progress)
 
 **Next Sprint**:
-- [ ] Deploy on GPU instance (AWS/GCP/Azure)
-- [ ] Implement streaming responses
-- [ ] Re-test and measure improvements
-- [ ] Set up production monitoring
+- [x] Deploy on GPU instance (AWS/GCP/Azure)
+- [x] Implement streaming responses
+- [x] Re-test and measure improvements
+- [x] Set up production monitoring
 
 **Long-term** (Q1 2025):
 - [ ] Evaluate vLLM/TGI migration

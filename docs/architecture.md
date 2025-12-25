@@ -4,6 +4,172 @@
 
 This document describes the architecture of the LLM Latency Bottleneck Analysis system, a production-grade platform for identifying and analyzing performance bottlenecks in LLM inference pipelines.
 
+---
+
+# PART 1: TARGET STATE ARCHITECTURE
+
+> **Migration Status**: Planning Phase
+> **Target Date**: Q1 2025
+> **Reference Documents**:
+> - `PLAN.md` - Step-by-step implementation guide
+> - `docs/ADR-001-INFERENCE-ENGINE.md` - vLLM vs TGI decision record
+
+## The One Diagram (Target State)
+
+```
+                                    PRODUCTION LLM INFERENCE PLATFORM
+                                    ==================================
+
+                    +------------------------------------------------------------------+
+                    |                        CONTROL PLANE                             |
+                    |  +------------------+  +-------------------+  +----------------+ |
+                    |  | Model Registry   |  | Config Management |  | Secrets Vault  | |
+                    |  | (S3 + DynamoDB)  |  | (ConfigMaps)      |  | (AWS SM)       | |
+                    |  +--------+---------+  +---------+---------+  +-------+--------+ |
+                    +-----------|--------------------|----------------------|-----------+
+                                |                    |                      |
+    +==========+                v                    v                      v
+    | CLIENTS  |     +------------------------------------------------------------------+
+    | - Web    |     |                         INGRESS LAYER                            |
+    | - Mobile |     |  +------------------+                    +---------------------+ |
+    | - API    |====>|  | AWS ALB / NLB    |                    | Rate Limiter        | |
+    +==========+     |  | (TLS Termination)|                    | (Token Bucket)      | |
+                     |  +--------+---------+                    +----------+----------+ |
+                     +-----------|----------------------------------------|-------------+
+                                 |                                        |
+                                 v                                        v
+                     +------------------------------------------------------------------+
+                     |                      KUBERNETES LAYER                            |
+                     |  +----------------------------------------------------------+   |
+                     |  |                    KEDA Scaler                           |   |
+                     |  |  Metrics: queue_depth, gpu_util, requests_in_flight      |   |
+                     |  +------------------------------+---------------------------+   |
+                     |                                 |                               |
+                     |            +--------------------|--------------------+          |
+                     |            |                    |                    |          |
+                     |            v                    v                    v          |
+                     |  +-----------------+  +-----------------+  +-----------------+  |
+                     |  | Inference Pod 1 |  | Inference Pod 2 |  | Inference Pod N |  |
+                     |  | +-------------+ |  | +-------------+ |  | +-------------+ |  |
+                     |  | | vLLM Engine | |  | | vLLM Engine | |  | | vLLM Engine | |  |
+                     |  | | - Paged Attn| |  | | - Paged Attn| |  | | - Paged Attn| |  |
+                     |  | | - Cont Batch| |  | | - Cont Batch| |  | | - Cont Batch| |  |
+                     |  | +------+------+ |  | +------+------+ |  | +------+------+ |  |
+                     |  |        |        |  |        |        |  |        |        |  |
+                     |  |  [NVIDIA GPU]   |  |  [NVIDIA GPU]   |  |  [NVIDIA GPU]   |  |
+                     |  +-----------------+  +-----------------+  +-----------------+  |
+                     +------------------------------------------------------------------+
+                                                    |
+                     +------------------------------------------------------------------+
+                     |                    OBSERVABILITY LAYER                           |
+                     |  +------------------+  +------------------+  +----------------+  |
+                     |  | OpenTelemetry    |  | Prometheus       |  | Grafana        |  |
+                     |  | Collector        |  | (TSDB)           |  | (Dashboards)   |  |
+                     |  +--------+---------+  +--------+---------+  +-------+--------+  |
+                     |           |                     |                    |           |
+                     |           +----------+----------+--------------------+           |
+                     |                      v                                           |
+                     |           +---------------------+    +------------------------+  |
+                     |           | Jaeger (Tracing)    |    | AlertManager + PagerDuty| |
+                     |           +---------------------+    +------------------------+  |
+                     +------------------------------------------------------------------+
+```
+
+## Target Request Flow
+
+```
++--------+    +--------+    +----------+    +--------+    +----------+    +--------+
+| Client | -> | ALB/   | -> | Rate     | -> | K8s    | -> | vLLM     | -> | Client |
+|        |    | NLB    |    | Limiter  |    | Service|    | Pod      |    |        |
++--------+    +--------+    +----------+    +--------+    +----------+    +--------+
+    |             |              |              |              |              |
+    |  1. HTTPS   |              |              |              |              |
+    |  Request    |              |              |              |              |
+    |------------>|              |              |              |              |
+    |             | 2. Check     |              |              |              |
+    |             | Rate Limit   |              |              |              |
+    |             |------------->|              |              |              |
+    |             |              | 3. Route to  |              |              |
+    |             |              | healthy pod  |              |              |
+    |             |              |------------->|              |              |
+    |             |              |              | 4. Queue &   |              |
+    |             |              |              | Continuous   |              |
+    |             |              |              | Batch        |              |
+    |             |              |              |------------->|              |
+    |             |              |              |              | 5. Generate  |
+    |             |              |              |              | w/ PagedAttn |
+    |             |              |              |<-------------|              |
+    |             |              |<-------------|              |              |
+    |             |<-------------|              |              |              |
+    |<------------|              |              |              |              |
+    |  6. SSE     |              |              |              |              |
+    |  Stream     |              |              |              |              |
+```
+
+## Current State vs Target State
+
+| Aspect | Current State | Target State | Improvement |
+|--------|---------------|--------------|-------------|
+| **Inference Engine** | Custom PyTorch/Transformers | vLLM with PagedAttention | 20x throughput |
+| **Deployment** | Bare metal / VM | Kubernetes (EKS) | Zero-downtime |
+| **Scaling** | Manual (semaphore=1) | KEDA auto-scaling (1-10 pods) | Auto recovery |
+| **Model Versioning** | HuggingFace Hub ID | Immutable S3 Registry + DynamoDB | < 1min rollback |
+| **Rollback** | Redeploy (10+ min) | Blue-Green (< 60 seconds) | 10x faster |
+| **API** | Custom FastAPI | OpenAI-compatible (vLLM native) | Drop-in replacement |
+| **Throughput** | 0.12 req/s | 100+ req/s | 833x |
+| **TTFT P95** | 7.7s | < 500ms | 15x faster |
+| **Concurrency** | 1 request | 100+ (continuous batching) | 100x |
+| **Cost** | $5+/M tokens | < $0.60/M tokens | 8x cheaper |
+
+## Key Architectural Decisions
+
+### 1. Inference Engine: vLLM
+- **Decision**: Migrate from custom PyTorch/Transformers to vLLM
+- **Why**: PagedAttention provides 24x memory efficiency, continuous batching for 3-5x throughput
+- **Trade-off**: Learning curve vs. massive performance gain
+- **Reference**: `docs/ADR-001-INFERENCE-ENGINE.md`
+
+### 2. Orchestration: Kubernetes + KEDA
+- **Decision**: Event-driven auto-scaling based on queue depth and GPU utilization
+- **Why**: Zero-downtime deployments, automatic scaling, industry standard
+- **Trade-off**: Operational complexity vs. reliability
+
+### 3. Model Registry: S3 + DynamoDB
+- **Decision**: Immutable versioning with SHA256 checksums
+- **Why**: Sub-1-minute rollbacks, audit trail, reproducibility
+- **Trade-off**: Additional infrastructure vs. safety
+
+### 4. Cost Optimization: Spot Instances + AWQ Quantization
+- **Decision**: 60% savings from spot, 40% memory reduction from AWQ
+- **Why**: Production costs must be sustainable
+- **Trade-off**: Spot interruptions vs. cost savings (mitigated by graceful shutdown)
+
+## Recovery & SLAs (Target)
+
+| Failure Scenario | Detection | Recovery | RTO |
+|------------------|-----------|----------|-----|
+| Pod crash | 10s (liveness probe) | 30s (restart) | < 1 min |
+| Node failure | 30s (node-problem-detector) | 60s (reschedule) | < 2 min |
+| Bad deployment | 5s (error rate spike) | 45s (rollback) | < 1 min |
+| AZ failure | 60s (health checks) | 120s (failover) | < 3 min |
+| Model corruption | Load failure | 60s (rollback) | < 2 min |
+
+## Service Level Objectives (Target)
+
+| Metric | Current | SLO Target |
+|--------|---------|------------|
+| Availability | 99.5% | 99.9% |
+| TTFT P95 | 7.7s | < 1s |
+| TPOT P95 | 300ms | < 100ms |
+| Error Rate | 0.5% | < 0.1% |
+| Throughput | 0.12/s | > 100/s |
+
+---
+
+# PART 2: CURRENT STATE ARCHITECTURE
+
+> The following sections describe the current implementation that will be migrated.
+
 ## High-Level Architecture
 
 ```
