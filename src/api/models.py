@@ -4,7 +4,7 @@ API Models
 Pydantic models for request/response validation and serialization.
 """
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field, field_validator, ConfigDict
 
 
@@ -203,6 +203,28 @@ class ErrorResponse(BaseModel):
             ]
         }
     }
+
+
+class ModelInfo(BaseModel):
+    """Model information and status."""
+    
+    model_config = ConfigDict(protected_namespaces=())
+    
+    model_name: str = Field(..., description="Name of the loaded model")
+    device: str = Field(..., description="Device model is running on")
+    loaded: bool = Field(..., description="Whether model is loaded")
+    quantization: bool = Field(..., description="Whether quantization is enabled")
+    max_length: int = Field(..., description="Maximum sequence length")
+    gpu_memory_allocated_gb: Optional[float] = Field(
+        default=None,
+        description="GPU memory allocated in GB",
+        ge=0.0,
+    )
+    gpu_memory_reserved_gb: Optional[float] = Field(
+        default=None,
+        description="GPU memory reserved in GB", 
+        ge=0.0,
+    )
 
 
 class MetricsSnapshot(BaseModel):

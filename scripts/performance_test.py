@@ -22,6 +22,99 @@ class PerformanceTestSuite:
         self.base_url = base_url
         self.results = {}
         
+    async def test_batching_performance(
+        self,
+        prompt: str,
+        max_tokens: int = 256,
+        concurrency_levels: List[int] = [1, 2, 4, 8],
+        requests_per_level: int = 20
+    ) -> Dict[str, Any]:
+        """Test batching performance with different concurrency levels."""
+        print(f"Testing batching performance...")
+        
+        url = f"{self.base_url}/generate"
+        request_data = {
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "do_sample": True
+        }
+        
+        results = {
+            "concurrency_levels": concurrency_levels,
+            "metrics": {}
+        }
+        
+        for concurrency in concurrency_levels:
+            print(f"  Testing concurrency level: {concurrency}")
+            
+            times = []
+            ttfts = []
+            tpots = []
+            throughputs = []
+            errors = 0
+            
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
+                # Create semaphore for concurrency control
+                semaphore = asyncio.Semaphore(concurrency)
+                
+                async def make_request():
+                    async with semaphore:
+                        try:
+                            start_time = time.time()
+                            async with session.post(url, json=request_data) as response:
+                                if response.status == 200:
+                                    result = await response.json()
+                                    end_time = time.time()
+                                    
+                                    times.append(end_time - start_time)
+                                    ttfts.append(result.get("ttft", 0))
+                                    tpots.append(result.get("tpot", 0))
+                                    throughputs.append(result.get("throughput_tokens_per_sec", 0))
+                                else:
+                                    errors += 1
+                                    print(f"    Error: HTTP {response.status}")
+                        except Exception as e:
+                            errors += 1
+                            print(f"    Exception: {e}")
+                
+                # Run requests concurrently
+                tasks = [make_request() for _ in range(requests_per_level)]
+                await asyncio.gather(*tasks)
+            
+            # Calculate metrics for this concurrency level
+            if times:
+                results["metrics"][concurrency] = {
+                    "avg_time": statistics.mean(times),
+                    "p95_time": statistics.quantiles(times, n=20)[18] if len(times) > 20 else max(times),
+                    "avg_ttft": statistics.mean(ttfts) if ttfts else 0,
+                    "avg_tpot": statistics.mean(tpots) if tpots else 0,
+                    "avg_throughput": statistics.mean(throughputs) if throughputs else 0,
+                    "total_requests": requests_per_level,
+                    "successful_requests": len(times),
+                    "error_rate": errors / requests_per_level,
+                    "requests_per_second": len(times) / sum(times) if times else 0
+                }
+            else:
+                results["metrics"][concurrency] = {
+                    "avg_time": 0,
+                    "p95_time": 0,
+                    "avg_ttft": 0,
+                    "avg_tpot": 0,
+                    "avg_throughput": 0,
+                    "total_requests": requests_per_level,
+                    "successful_requests": 0,
+                    "error_rate": 1.0,
+                    "requests_per_second": 0
+                }
+            
+            print(f"    Avg time: {results['metrics'][concurrency]['avg_time']:.3f}s")
+            print(f"    Error rate: {results['metrics'][concurrency]['error_rate']:.2%}")
+            print(f"    Throughput: {results['metrics'][concurrency]['avg_throughput']:.1f} tok/s")
+        
+        return results
+    
     async def test_single_generation(
         self,
         prompt: str,
@@ -481,6 +574,8 @@ async def main():
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 4, 8, 16], help="Batch sizes to test")
     parser.add_argument("--output", help="Save results to JSON file")
     parser.add_argument("--summary-only", action="store_true", help="Only show summary")
+    parser.add_argument("--test-batching", action="store_true", help="Test batching performance")
+    parser.add_argument("--concurrency-levels", nargs="+", type=int, default=[1, 2, 4, 8], help="Concurrency levels for batching test")
     
     args = parser.parse_args()
     
@@ -488,13 +583,33 @@ async def main():
     test_suite = PerformanceTestSuite(args.url)
     
     try:
-        # Run comprehensive test
-        results = await test_suite.run_comprehensive_test(
-            prompt=args.prompt,
-            max_tokens=args.max_tokens,
-            batch_sizes=args.batch_sizes,
-            num_requests=args.num_requests
-        )
+        if args.test_batching:
+            # Run batching performance test
+            print("=== BATCHING PERFORMANCE TEST ===")
+            results = await test_suite.test_batching_performance(
+                prompt=args.prompt,
+                max_tokens=args.max_tokens,
+                concurrency_levels=args.concurrency_levels,
+                requests_per_level=args.num_requests
+            )
+            test_suite.results["batching_performance"] = results
+            
+            # Print batching results
+            print("\n=== BATCHING RESULTS ===")
+            for level, metrics in results["metrics"].items():
+                print(f"Concurrency {level}:")
+                print(f"  Avg time: {metrics['avg_time']:.3f}s")
+                print(f"  Error rate: {metrics['error_rate']:.2%}")
+                print(f"  Throughput: {metrics['avg_throughput']:.1f} tok/s")
+                print(f"  Requests/sec: {metrics['requests_per_second']:.1f}")
+        else:
+            # Run comprehensive test
+            results = await test_suite.run_comprehensive_test(
+                prompt=args.prompt,
+                max_tokens=args.max_tokens,
+                batch_sizes=args.batch_sizes,
+                num_requests=args.num_requests
+            )
         
         # Print results
         if not args.summary_only:

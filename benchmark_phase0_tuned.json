@@ -1,0 +1,21 @@
+[
+  {
+    "timestamp": "2025-12-26T06:40:48.964807",
+    "test_type": "concurrent",
+    "batch_size": 1,
+    "concurrent_requests": 10,
+    "ttft_p50": 4163.859299998876,
+    "ttft_p95": 5698.124800002552,
+    "ttft_p99": 6672.182800000883,
+    "tpot_p50": 0.0,
+    "tpot_p95": 0.0,
+    "tpot_p99": 0.0,
+    "throughput_tokens_per_sec": 29.18550039856262,
+    "requests_per_sec": 0.2194398526207716,
+    "vram_usage_gb": 0.0,
+    "ram_usage_gb": 22.146400451660156,
+    "error_rate": 0.3,
+    "total_tokens": 4655,
+    "total_requests": 50
+  }
+]

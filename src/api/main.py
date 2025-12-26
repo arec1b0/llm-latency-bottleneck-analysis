@@ -31,6 +31,7 @@ from .models import (
     StreamToken,
 )
 from ..inference import InferenceEngine
+from ..inference.batcher import RequestQueue, BatchScheduler
 from ..telemetry import setup_telemetry, shutdown_telemetry, MetricsCollector
 
 
@@ -47,9 +48,20 @@ logger = logging.getLogger(__name__)
 # Global inference engine instance
 inference_engine: Optional[InferenceEngine] = None
 
+# Batching system
+request_queue: Optional[RequestQueue] = None
+batch_scheduler: Optional[BatchScheduler] = None
+
 # Concurrency control
 inference_semaphore: Optional[asyncio.Semaphore] = None
 MAX_CONCURRENT_GENERATIONS = int(os.getenv("MAX_CONCURRENT_GENERATIONS", "1"))
+
+# Batching configuration
+ENABLE_BATCHING = os.getenv("ENABLE_BATCHING", "true").lower() == "true"
+MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", "4"))
+MAX_WAIT_TIME = float(os.getenv("MAX_WAIT_TIME", "0.05"))  # 50ms
+QUEUE_MAX_SIZE = int(os.getenv("QUEUE_MAX_SIZE", "1000"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "30.0"))
 
 # Request tracking
 active_requests_count = 0
@@ -73,6 +85,19 @@ async def lifespan(app: FastAPI):
     # Initialize concurrency control
     inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
     logger.info(f"Concurrency limit set to {MAX_CONCURRENT_GENERATIONS} concurrent generations")
+    
+    # Initialize batching system if enabled
+    if ENABLE_BATCHING:
+        request_queue = RequestQueue(max_size=QUEUE_MAX_SIZE, default_timeout=REQUEST_TIMEOUT)
+        batch_scheduler = BatchScheduler(
+            queue=request_queue,
+            engine=inference_engine,  # Will be set after engine initialization
+            max_batch_size=MAX_BATCH_SIZE,
+            max_wait_time=MAX_WAIT_TIME
+        )
+        logger.info(f"Batching enabled: max_batch_size={MAX_BATCH_SIZE}, max_wait_time={MAX_WAIT_TIME}s")
+    else:
+        logger.info("Batching disabled")
     
     # Initialize OpenTelemetry
     try:
@@ -99,6 +124,12 @@ async def lifespan(app: FastAPI):
         
         logger.info("Inference engine initialized")
         
+        # Initialize batch scheduler with engine
+        if ENABLE_BATCHING and batch_scheduler:
+            batch_scheduler.engine = inference_engine
+            await batch_scheduler.start()
+            logger.info("Batch scheduler started")
+        
         # Load model on startup (optional - can lazy load on first request)
         # Uncomment to preload model:
         # logger.info("Preloading model...")
@@ -113,6 +144,11 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     logger.info("Shutting down LLM Inference API")
+    
+    # Stop batch scheduler
+    if batch_scheduler:
+        await batch_scheduler.stop()
+        logger.info("Batch scheduler stopped")
     
     if inference_engine:
         inference_engine.unload_model()
@@ -203,7 +239,7 @@ async def health_check():
     
     Returns service status, model loading state, and system information.
     """
-    global inference_engine, inference_semaphore, active_requests_count
+    global inference_engine, inference_semaphore, active_requests_count, request_queue, batch_scheduler
     
     if not inference_engine:
         return HealthResponse(
@@ -229,8 +265,23 @@ async def health_check():
         # Subtract active requests to get actual queue depth
         queue_depth = max(0, queue_depth - active_requests_count)
     
+    # Add batch queue metrics if batching is enabled
+    batch_queue_size = 0
+    batch_pending_count = 0
+    if request_queue:
+        batch_queue_size = request_queue.get_queue_size()
+        batch_pending_count = request_queue.get_pending_count()
+        
+        # Include queue metrics in overall queue depth
+        queue_depth += batch_queue_size
+    
     # Update queue depth metric
     metrics.update_queue_depth(queue_depth)
+    
+    # Add batch scheduler metrics to response for debugging
+    scheduler_metrics = {}
+    if batch_scheduler:
+        scheduler_metrics = batch_scheduler.get_metrics()
     
     return HealthResponse(
         status=status,
@@ -254,7 +305,7 @@ async def generate_text(request: GenerateRequest):
     
     Returns generated text with detailed performance metrics.
     """
-    global inference_engine, inference_semaphore
+    global inference_engine, inference_semaphore, active_requests_count, request_queue
     
     if not inference_engine:
         logger.error("Inference engine not initialized")
@@ -263,6 +314,50 @@ async def generate_text(request: GenerateRequest):
             status_code=503,
             detail="Inference engine not initialized",
         )
+    
+    # Use batching if enabled, otherwise fall back to direct generation
+    if ENABLE_BATCHING and request_queue:
+        try:
+            # Enqueue request and wait for result
+            request_id = await request_queue.enqueue(request, timeout=REQUEST_TIMEOUT)
+            logger.debug(f"Request {request_id} queued for batch processing")
+            
+            # Wait for batched result
+            queued_request = await request_queue.get_pending_request(request_id)
+            if not queued_request:
+                raise HTTPException(status_code=500, detail="Failed to track request")
+            
+            try:
+                result = await asyncio.wait_for(queued_request.future, timeout=REQUEST_TIMEOUT)
+                return result
+            except asyncio.TimeoutError:
+                logger.error(f"Request {request_id} timed out waiting for batch processing")
+                metrics.record_error("request_timeout")
+                raise HTTPException(
+                    status_code=408,
+                    detail="Request timed out waiting for processing",
+                )
+                
+        except asyncio.QueueFull:
+            logger.error("Request queue is full")
+            metrics.record_error("queue_full")
+            raise HTTPException(
+                status_code=429,
+                detail="Service temporarily unavailable - queue full",
+            )
+    
+    # Fallback to direct generation (when batching disabled or as fallback)
+    return await _generate_direct(request)
+
+
+async def _generate_direct(request: GenerateRequest) -> GenerateResponse:
+    """
+    Direct generation fallback method.
+    
+    Used when batching is disabled or as a fallback mechanism.
+    Implements the original semaphore-based concurrency control.
+    """
+    global inference_engine, inference_semaphore, active_requests_count
     
     # Check concurrency limit
     if inference_semaphore is None:
@@ -361,7 +456,7 @@ async def generate_text_stream(request: GenerateRequest):
          -d '{"prompt": "Explain AI", "max_tokens": 50}' \
          --no-buffer
     """
-    global inference_engine, inference_semaphore
+    global inference_engine, inference_semaphore, active_requests_count
     
     if not inference_engine:
         logger.error("Inference engine not initialized")
@@ -488,6 +583,41 @@ async def get_metrics():
     """
     metrics_data, content_type = MetricsCollector.get_metrics_response()
     return Response(content=metrics_data, media_type=content_type)
+
+
+@app.get("/metrics/batching", tags=["Metrics"])
+async def get_batching_metrics():
+    """
+    Detailed batching system metrics.
+    
+    Returns comprehensive metrics about the batching system performance.
+    """
+    global request_queue, batch_scheduler
+    
+    if not ENABLE_BATCHING:
+        return {"batching_enabled": False}
+    
+    queue_metrics = {}
+    scheduler_metrics = {}
+    
+    if request_queue:
+        queue_metrics = request_queue.get_metrics()
+    
+    if batch_scheduler:
+        scheduler_metrics = batch_scheduler.get_metrics()
+    
+    return {
+        "batching_enabled": True,
+        "configuration": {
+            "max_batch_size": MAX_BATCH_SIZE,
+            "max_wait_time": MAX_WAIT_TIME,
+            "queue_max_size": QUEUE_MAX_SIZE,
+            "request_timeout": REQUEST_TIMEOUT,
+        },
+        "queue_metrics": queue_metrics,
+        "scheduler_metrics": scheduler_metrics,
+        "timestamp": time.time()
+    }
 
 
 @app.post("/generate_batch", response_model=BatchGenerateResponse, tags=["Generation"])
@@ -688,7 +818,7 @@ async def generate_text_stream(request: StreamGenerateRequest):
     Provides real-time token-by-token generation with comprehensive metrics.
     Returns Server-Sent Events (SSE) format for easy client consumption.
     """
-    global inference_engine, inference_semaphore
+    global inference_engine, inference_semaphore, active_requests_count
     
     if not inference_engine:
         raise HTTPException(
